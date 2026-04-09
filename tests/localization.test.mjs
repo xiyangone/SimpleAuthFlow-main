@@ -167,3 +167,50 @@ test('手动模式核心闭环标识已接入', () => {
     '侧边栏样式缺少验证码弹层样式'
   );
 });
+
+test('验证码等待配置与超时断点继续标识已接入', () => {
+  const sidepanelHtml = read('sidepanel/sidepanel.html');
+  const sidepanelJs = read('sidepanel/sidepanel.js');
+  const backgroundJs = read('background.js');
+
+  const requiredHtmlTokens = [
+    '验证码等待(秒)',
+    'input-otp-wait-seconds',
+  ];
+
+  for (const token of requiredHtmlTokens) {
+    assert.equal(
+      sidepanelHtml.includes(token),
+      true,
+      `侧边栏 HTML 缺少验证码等待配置标识: ${token}`
+    );
+  }
+
+  const requiredJsTokens = [
+    'otpWaitSeconds',
+    'waiting_otp_timeout',
+  ];
+
+  for (const token of requiredJsTokens) {
+    assert.equal(
+      sidepanelJs.includes(token),
+      true,
+      `侧边栏脚本缺少验证码等待关键标识: ${token}`
+    );
+  }
+
+  const requiredBackgroundTokens = [
+    'otpWaitSeconds',
+    'DEFAULT_OTP_WAIT_SECONDS',
+    'waiting_otp_timeout',
+    'OTP_TIMEOUT_PAUSE_ERROR',
+  ];
+
+  for (const token of requiredBackgroundTokens) {
+    assert.equal(
+      backgroundJs.includes(token),
+      true,
+      `后台脚本缺少验证码等待关键标识: ${token}`
+    );
+  }
+});

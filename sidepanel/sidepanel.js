@@ -10,7 +10,11 @@ const STATUS_ICONS = {
 
 const RUN_MODE_AUTO = 'auto';
 const RUN_MODE_MANUAL = 'manual';
+const EMAIL_PROVIDER_BURNER = 'burner_mailbox';
 const MANUAL_CODE_LENGTH = 6;
+const DEFAULT_OTP_WAIT_SECONDS = 180;
+const MIN_OTP_WAIT_SECONDS = 30;
+const MAX_OTP_WAIT_SECONDS = 600;
 const AUTO_BUTTON_HTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> 自动';
 
 const logArea = document.getElementById('log-area');
@@ -21,15 +25,20 @@ const statusBar = document.getElementById('status-bar');
 const inputEmail = document.getElementById('input-email');
 const inputPassword = document.getElementById('input-password');
 const inputVpsUrl = document.getElementById('input-vps-url');
+const inputOtpWaitSeconds = document.getElementById('input-otp-wait-seconds');
+const otpWaitRow = inputOtpWaitSeconds ? inputOtpWaitSeconds.closest('.data-row') : null;
 const inputRunCount = document.getElementById('input-run-count');
 const selectRunMode = document.getElementById('select-run-mode');
 const btnFetchEmail = document.getElementById('btn-fetch-email');
+const emailServiceRow = findDataRowByLabel('邮箱服务');
+const selectEmailProvider = ensureEmailProviderDropdown();
 const btnTogglePassword = document.getElementById('btn-toggle-password');
 const btnStop = document.getElementById('btn-stop');
 const btnReset = document.getElementById('btn-reset');
 const btnAutoRun = document.getElementById('btn-auto-run');
 const btnAutoContinue = document.getElementById('btn-auto-continue');
 const btnClearLog = document.getElementById('btn-clear-log');
+const btnDownloadLog = ensureDownloadLogButton();
 const autoContinueBar = document.getElementById('auto-continue-bar');
 const autoContinueHint = document.getElementById('auto-continue-hint');
 const stepsProgress = document.getElementById('steps-progress');
@@ -63,7 +72,50 @@ const LEVEL_LABELS = {
   ok: '成功',
 };
 
+function ensureDownloadLogButton() {
+  const logHeader = document.querySelector('.log-header');
+  if (!logHeader) return null;
+  const clearButton = document.getElementById('btn-clear-log');
+
+  let actions = document.getElementById('log-actions');
+  if (!actions) {
+    actions = document.createElement('div');
+    actions.id = 'log-actions';
+    actions.style.display = 'inline-flex';
+    actions.style.alignItems = 'center';
+    actions.style.gap = '6px';
+    logHeader.appendChild(actions);
+  }
+
+  if (clearButton && clearButton.parentElement !== actions) {
+    actions.appendChild(clearButton);
+  }
+
+  const existing = document.getElementById('btn-download-log');
+  if (existing) {
+    if (existing.parentElement !== actions) actions.appendChild(existing);
+    return existing;
+  }
+
+  const button = document.createElement('button');
+  button.id = 'btn-download-log';
+  button.className = 'btn btn-ghost btn-xs';
+  button.title = '下载日志(JSON)';
+  button.textContent = '下载';
+  actions.appendChild(button);
+  return button;
+}
+
 function showToast(message, type = 'error', duration = 4000) {
+  if (type === 'error') {
+    appendLog({
+      timestamp: Date.now(),
+      level: 'error',
+      message: String(message || '发生错误'),
+    });
+    return;
+  }
+
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
   toast.innerHTML = `${TOAST_ICONS[type] || ''}<span class="toast-msg">${escapeHtml(message)}</span><button class="toast-close">&times;</button>`;
@@ -86,13 +138,70 @@ function normalizeRunMode(mode) {
   return String(mode || '').trim() === RUN_MODE_MANUAL ? RUN_MODE_MANUAL : RUN_MODE_AUTO;
 }
 
+function normalizeOtpWaitSeconds(value) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_OTP_WAIT_SECONDS;
+  return Math.max(MIN_OTP_WAIT_SECONDS, Math.min(MAX_OTP_WAIT_SECONDS, parsed));
+}
+
+function normalizeEmailProvider(value) {
+  const normalized = String(value || '').trim();
+  return normalized || EMAIL_PROVIDER_BURNER;
+}
+
+function findDataRowByLabel(label) {
+  return Array.from(document.querySelectorAll('#data-section .data-row')).find((row) => {
+    const labelEl = row.querySelector('.data-label');
+    return labelEl && labelEl.textContent.trim() === label;
+  }) || null;
+}
+
+function ensureEmailProviderDropdown() {
+  if (!emailServiceRow) return null;
+  const oldValue = emailServiceRow.querySelector('.data-value');
+  if (!oldValue) return emailServiceRow.querySelector('#select-email-provider');
+
+  const select = document.createElement('select');
+  select.id = 'select-email-provider';
+  select.className = 'data-select';
+
+  const option = document.createElement('option');
+  option.value = EMAIL_PROVIDER_BURNER;
+  option.textContent = 'Burner Mailbox';
+  option.selected = true;
+  select.appendChild(option);
+
+  oldValue.replaceWith(select);
+  return select;
+}
+
 function isManualMode(mode = currentRunMode) {
   return normalizeRunMode(mode) === RUN_MODE_MANUAL;
+}
+
+function getEmailPauseHint(mode = currentRunMode) {
+  if (isManualMode(mode)) {
+    return '手动模式请粘贴邮箱后点击“继续”';
+  }
+  return '点击“自动”获取 Burner Mailbox 邮箱，或手动粘贴后继续';
+}
+
+function getEmailRequiredWarn(mode = currentRunMode) {
+  if (isManualMode(mode)) {
+    return '请先粘贴邮箱地址';
+  }
+  return '请先获取或粘贴 Burner Mailbox 邮箱地址';
 }
 
 function applyRunModeUI(mode) {
   currentRunMode = normalizeRunMode(mode);
   selectRunMode.value = currentRunMode;
+  if (emailServiceRow) {
+    emailServiceRow.style.display = isManualMode() ? 'none' : '';
+  }
+  if (otpWaitRow) {
+    otpWaitRow.style.display = isManualMode() ? 'none' : '';
+  }
 
   if (isManualMode()) {
     btnFetchEmail.style.display = 'none';
@@ -150,6 +259,10 @@ async function restoreState() {
     if (state.vpsUrl) {
       inputVpsUrl.value = state.vpsUrl;
     }
+    if (selectEmailProvider) {
+      selectEmailProvider.value = normalizeEmailProvider(state.emailProvider);
+    }
+    inputOtpWaitSeconds.value = String(normalizeOtpWaitSeconds(state.otpWaitSeconds));
 
     if (state.stepStatuses) {
       for (const [step, status] of Object.entries(state.stepStatuses)) {
@@ -317,7 +430,51 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function buildLogExportFileName() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const yyyy = now.getFullYear();
+  const mm = pad(now.getMonth() + 1);
+  const dd = pad(now.getDate());
+  const hh = pad(now.getHours());
+  const mi = pad(now.getMinutes());
+  const ss = pad(now.getSeconds());
+  return `simpleauthflow-logs-${yyyy}${mm}${dd}-${hh}${mi}${ss}.json`;
+}
+
+async function downloadLogsAsJson() {
+  try {
+    const state = await chrome.runtime.sendMessage({ type: 'GET_STATE', source: 'sidepanel' });
+    const logs = Array.isArray(state?.logs) ? state.logs : [];
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      count: logs.length,
+      logs,
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = buildLogExportFileName();
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    showToast(`日志已下载（${logs.length} 条）`, 'success', 2200);
+  } catch (err) {
+    showToast(`下载日志失败：${err.message}`, 'warn', 2600);
+  }
+}
+
 async function persistDraftSettings() {
+  const otpWaitSeconds = normalizeOtpWaitSeconds(inputOtpWaitSeconds.value);
+  inputOtpWaitSeconds.value = String(otpWaitSeconds);
+  const emailProvider = normalizeEmailProvider(selectEmailProvider?.value);
+  if (selectEmailProvider) {
+    selectEmailProvider.value = emailProvider;
+  }
+
   await chrome.runtime.sendMessage({
     type: 'SAVE_SETTING',
     source: 'sidepanel',
@@ -325,6 +482,8 @@ async function persistDraftSettings() {
       vpsUrl: inputVpsUrl.value.trim(),
       customPassword: inputPassword.value,
       runMode: normalizeRunMode(selectRunMode.value),
+      otpWaitSeconds,
+      emailProvider,
     },
   });
 
@@ -442,7 +601,7 @@ btnAutoContinue.addEventListener('click', async () => {
   if (autoContinueMode === 'email') {
     const email = inputEmail.value.trim();
     if (!email) {
-      showToast('请先获取或粘贴 Burner Mailbox 邮箱地址', 'warn');
+      showToast(getEmailRequiredWarn(), 'warn');
       return;
     }
     await persistDraftSettings();
@@ -516,7 +675,7 @@ btnReset.addEventListener('click', async () => {
     autoContinueBar.style.display = 'none';
     hideManualCodeModal();
     autoContinueMode = 'email';
-    autoContinueHint.textContent = '点击“自动”获取 Burner Mailbox 邮箱，或手动粘贴后继续';
+    autoContinueHint.textContent = getEmailPauseHint();
     updateStopButtonState(false);
     updateButtonStates();
     updateProgressCounter();
@@ -531,9 +690,31 @@ btnClearLog.addEventListener('click', () => {
   logArea.innerHTML = '';
 });
 
+if (btnDownloadLog) {
+  btnDownloadLog.addEventListener('click', async () => {
+    await downloadLogsAsJson();
+  });
+}
+
 // Save settings on change
 selectRunMode.addEventListener('change', async () => {
   applyRunModeUI(selectRunMode.value);
+  await persistDraftSettings();
+});
+
+if (selectEmailProvider) {
+  selectEmailProvider.addEventListener('change', async () => {
+    selectEmailProvider.value = normalizeEmailProvider(selectEmailProvider.value);
+    await persistDraftSettings();
+  });
+}
+
+inputOtpWaitSeconds.addEventListener('input', () => {
+  inputOtpWaitSeconds.value = String(normalizeOtpWaitSeconds(inputOtpWaitSeconds.value));
+});
+
+inputOtpWaitSeconds.addEventListener('change', async () => {
+  inputOtpWaitSeconds.value = String(normalizeOtpWaitSeconds(inputOtpWaitSeconds.value));
   await persistDraftSettings();
 });
 
@@ -557,9 +738,6 @@ chrome.runtime.onMessage.addListener((message) => {
   switch (message.type) {
     case 'LOG_ENTRY':
       appendLog(message.payload);
-      if (message.payload.level === 'error') {
-        showToast(message.payload.message, 'error');
-      }
       break;
 
     case 'STEP_STATUS_CHANGED': {
@@ -591,7 +769,9 @@ chrome.runtime.onMessage.addListener((message) => {
       displayOauthUrl.classList.remove('has-value');
       displayLocalhostUrl.textContent = '等待中...';
       displayLocalhostUrl.classList.remove('has-value');
-      inputEmail.value = '';
+      if (!isManualMode()) {
+        inputEmail.value = '';
+      }
       displayStatus.textContent = '就绪';
       statusBar.className = 'status-bar';
       logArea.innerHTML = '';
@@ -599,7 +779,7 @@ chrome.runtime.onMessage.addListener((message) => {
       document.querySelectorAll('.step-status').forEach(el => el.textContent = '');
       updateStopButtonState(false);
       autoContinueMode = 'email';
-      autoContinueHint.textContent = '点击“自动”获取 Burner Mailbox 邮箱，或手动粘贴后继续';
+      autoContinueHint.textContent = getEmailPauseHint();
       hideManualCodeModal();
       updateProgressCounter();
       break;
@@ -608,6 +788,9 @@ chrome.runtime.onMessage.addListener((message) => {
     case 'DATA_UPDATED': {
       if (message.payload.runMode !== undefined) {
         applyRunModeUI(message.payload.runMode);
+      }
+      if (message.payload.otpWaitSeconds !== undefined) {
+        inputOtpWaitSeconds.value = String(normalizeOtpWaitSeconds(message.payload.otpWaitSeconds));
       }
       if (message.payload.email !== undefined) {
         inputEmail.value = message.payload.email || '';
@@ -640,7 +823,7 @@ chrome.runtime.onMessage.addListener((message) => {
         case 'waiting_email':
           autoContinueBar.style.display = 'flex';
           autoContinueMode = 'email';
-          autoContinueHint.textContent = '点击“自动”获取 Burner Mailbox 邮箱，或手动粘贴后继续';
+          autoContinueHint.textContent = message.payload?.hint || getEmailPauseHint();
           btnAutoRun.innerHTML = `已暂停${runLabel}`;
           updateStopButtonState(true);
           hideManualCodeModal();
@@ -649,6 +832,14 @@ chrome.runtime.onMessage.addListener((message) => {
           autoContinueBar.style.display = 'flex';
           autoContinueMode = 'challenge';
           autoContinueHint.textContent = 'Burner Mailbox 需要先完成人机验证。请在邮箱页完成验证后点击“继续”';
+          btnAutoRun.innerHTML = `已暂停${runLabel}`;
+          updateStopButtonState(true);
+          hideManualCodeModal();
+          break;
+        case 'waiting_otp_timeout':
+          autoContinueBar.style.display = 'flex';
+          autoContinueMode = 'otp_timeout';
+          autoContinueHint.textContent = message.payload.hint || '验证码等待超时，点击“继续”后再次轮询并重发。';
           btnAutoRun.innerHTML = `已暂停${runLabel}`;
           updateStopButtonState(true);
           hideManualCodeModal();
@@ -670,7 +861,7 @@ chrome.runtime.onMessage.addListener((message) => {
           btnAutoRun.innerHTML = AUTO_BUTTON_HTML;
           autoContinueBar.style.display = 'none';
           autoContinueMode = 'email';
-          autoContinueHint.textContent = '点击“自动”获取 Burner Mailbox 邮箱，或手动粘贴后继续';
+          autoContinueHint.textContent = getEmailPauseHint();
           updateStopButtonState(false);
           hideManualCodeModal();
           break;
@@ -680,7 +871,7 @@ chrome.runtime.onMessage.addListener((message) => {
           btnAutoRun.innerHTML = AUTO_BUTTON_HTML;
           autoContinueBar.style.display = 'none';
           autoContinueMode = 'email';
-          autoContinueHint.textContent = '点击“自动”获取 Burner Mailbox 邮箱，或手动粘贴后继续';
+          autoContinueHint.textContent = getEmailPauseHint();
           updateStopButtonState(false);
           break;
       }

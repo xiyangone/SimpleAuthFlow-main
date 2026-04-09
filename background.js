@@ -13,6 +13,12 @@ const RUN_MODE_AUTO = 'auto';
 const RUN_MODE_MANUAL = 'manual';
 const MANUAL_CODE_LENGTH = 6;
 const MANUAL_CODE_PAUSE_ERROR = 'MANUAL_CODE_REQUIRED';
+const OTP_TIMEOUT_PAUSE_ERROR = 'OTP_TIMEOUT_PAUSE';
+const OTP_POLL_INTERVAL_MS = 4000;
+const OTP_RESEND_INTERVAL_MS = 20000;
+const DEFAULT_OTP_WAIT_SECONDS = 180;
+const MIN_OTP_WAIT_SECONDS = 30;
+const MAX_OTP_WAIT_SECONDS = 600;
 
 initializeSessionStorageAccess();
 
@@ -42,6 +48,7 @@ const DEFAULT_STATE = {
   customPassword: '',
   runMode: RUN_MODE_AUTO,
   manualCodeEntry: null,
+  otpWaitSeconds: DEFAULT_OTP_WAIT_SECONDS,
 };
 
 async function getState() {
@@ -51,6 +58,7 @@ async function getState() {
     ...merged,
     runMode: normalizeRunMode(merged.runMode),
     manualCodeEntry: merged.manualCodeEntry || null,
+    otpWaitSeconds: normalizeOtpWaitSeconds(merged.otpWaitSeconds),
   };
 }
 
@@ -105,6 +113,12 @@ function normalizeRunMode(value) {
   return String(value || '').trim() === RUN_MODE_MANUAL ? RUN_MODE_MANUAL : RUN_MODE_AUTO;
 }
 
+function normalizeOtpWaitSeconds(value) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_OTP_WAIT_SECONDS;
+  return Math.max(MIN_OTP_WAIT_SECONDS, Math.min(MAX_OTP_WAIT_SECONDS, parsed));
+}
+
 function isManualRunMode(state) {
   return normalizeRunMode(state?.runMode) === RUN_MODE_MANUAL;
 }
@@ -157,6 +171,7 @@ async function resetState() {
     'vpsUrl',
     'customPassword',
     'runMode',
+    'otpWaitSeconds',
   ]);
   await chrome.storage.session.clear();
   await chrome.storage.session.set({
@@ -170,6 +185,7 @@ async function resetState() {
     customPassword: prev.customPassword || '',
     runMode: normalizeRunMode(prev.runMode),
     manualCodeEntry: null,
+    otpWaitSeconds: normalizeOtpWaitSeconds(prev.otpWaitSeconds),
   });
 }
 
@@ -495,6 +511,11 @@ function isManualCodePauseError(error) {
   return message === MANUAL_CODE_PAUSE_ERROR;
 }
 
+function isOtpTimeoutPauseError(error) {
+  const message = typeof error === 'string' ? error : error?.message;
+  return message === OTP_TIMEOUT_PAUSE_ERROR;
+}
+
 function clearStopRequest() {
   stopRequested = false;
 }
@@ -691,9 +712,13 @@ async function handleMessage(message, sender) {
       if (message.payload.vpsUrl !== undefined) updates.vpsUrl = normalizeVpsUrl(message.payload.vpsUrl);
       if (message.payload.customPassword !== undefined) updates.customPassword = message.payload.customPassword;
       if (message.payload.runMode !== undefined) updates.runMode = normalizeRunMode(message.payload.runMode);
+      if (message.payload.otpWaitSeconds !== undefined) updates.otpWaitSeconds = normalizeOtpWaitSeconds(message.payload.otpWaitSeconds);
       await setState(updates);
       if (Object.prototype.hasOwnProperty.call(updates, 'runMode')) {
         broadcastDataUpdate({ runMode: updates.runMode });
+      }
+      if (Object.prototype.hasOwnProperty.call(updates, 'otpWaitSeconds')) {
+        broadcastDataUpdate({ otpWaitSeconds: updates.otpWaitSeconds });
       }
       return { ok: true };
     }
@@ -863,6 +888,28 @@ async function requestManualCodePause(step) {
   }
 }
 
+async function requestOtpTimeoutPause(step, state) {
+  const waitSeconds = normalizeOtpWaitSeconds(state?.otpWaitSeconds);
+  await setStepStatus(step, 'stopped');
+  await addLog(`步骤 ${step}：等待验证码超时（${waitSeconds} 秒），点击“继续”后将再次轮询并重发。`, 'warn');
+  chrome.runtime.sendMessage({
+    type: 'AUTO_RUN_STATUS',
+    payload: {
+      phase: 'waiting_otp_timeout',
+      currentRun: autoRunCurrentRun,
+      totalRuns: autoRunTotalRuns,
+      step,
+      waitSeconds,
+      hint: `验证码等待超时（${waitSeconds} 秒），点击“继续”后再次轮询并重发。`,
+    },
+  }).catch(() => {});
+
+  if (autoRunActive) {
+    autoRunResumeMode = 'otp_timeout';
+    throw new Error(OTP_TIMEOUT_PAUSE_ERROR);
+  }
+}
+
 async function submitManualCodeAndContinue(payload = {}) {
   const state = await getState();
   const step = Number(state.manualCodeEntry?.step || state.currentStep || 0);
@@ -940,6 +987,9 @@ async function executeStep(step) {
     if (isManualCodePauseError(err)) {
       throw err;
     }
+    if (isOtpTimeoutPauseError(err)) {
+      throw err;
+    }
     await setStepStatus(step, 'failed');
     await addLog(`步骤 ${step} 失败：${err.message}`, 'error');
     throw err;
@@ -954,12 +1004,19 @@ async function executeStep(step) {
 async function executeStepAndWait(step, delayAfter = 2000) {
   throwIfStopped();
   const promise = waitForStepComplete(step, 600000);
-  try {
-    await executeStep(step);
-  } catch (err) {
-    if (isManualCodePauseError(err)) {
-      await waitForResume();
-    } else {
+  while (true) {
+    try {
+      await executeStep(step);
+      break;
+    } catch (err) {
+      if (isManualCodePauseError(err)) {
+        await waitForResume();
+        break;
+      }
+      if (isOtpTimeoutPauseError(err)) {
+        await waitForResume();
+        continue;
+      }
       throw err;
     }
   }
@@ -1351,13 +1408,19 @@ async function autoRunLoop(totalRuns) {
 
     // Reset everything at the start of each run (keep VPS/password settings)
     const prevState = await getState();
+    const runMode = normalizeRunMode(prevState.runMode);
+    const isManualModeRun = runMode === RUN_MODE_MANUAL;
     const keepSettings = {
       vpsUrl: prevState.vpsUrl,
       customPassword: prevState.customPassword,
-      runMode: normalizeRunMode(prevState.runMode),
+      runMode,
       manualCodeEntry: null,
+      otpWaitSeconds: normalizeOtpWaitSeconds(prevState.otpWaitSeconds),
       autoRunning: true,
     };
+    if (isManualModeRun && prevState.email) {
+      keepSettings.email = prevState.email;
+    }
     await resetState();
     await setState(keepSettings);
     // Tell side panel to reset all UI
@@ -1365,7 +1428,10 @@ async function autoRunLoop(totalRuns) {
     await sleepWithStop(500);
 
     await addLog(`=== 自动运行 ${run}/${totalRuns}：阶段 1，获取 OAuth 链接并打开注册页 ===`, 'info');
-    const status = (phase) => ({ type: 'AUTO_RUN_STATUS', payload: { phase, currentRun: run, totalRuns } });
+    const status = (phase, payload = {}) => ({
+      type: 'AUTO_RUN_STATUS',
+      payload: { phase, currentRun: run, totalRuns, ...payload },
+    });
 
     try {
       throwIfStopped();
@@ -1375,27 +1441,46 @@ async function autoRunLoop(totalRuns) {
       await executeStepAndWait(2, 2000);
 
       let emailReady = false;
-      while (!emailReady) {
-        try {
-          const burnerEmail = await fetchBurnerEmail({ generateNew: true });
-          await addLog(`=== 第 ${run}/${totalRuns} 轮：Burner 邮箱已就绪：${burnerEmail} ===`, 'ok');
+      if (isManualModeRun) {
+        const manualState = await getState();
+        if (manualState.email) {
+          await addLog(`=== 第 ${run}/${totalRuns} 轮：手动模式邮箱已就绪：${manualState.email} ===`, 'ok');
           emailReady = true;
           autoRunResumeMode = null;
-        } catch (err) {
-          if (isBurnerChallengeError(err)) {
-            await waitForBurnerChallengeResolution(`Run ${run}/${totalRuns}`);
-            continue;
-          }
+        } else {
+          await addLog(`=== 第 ${run}/${totalRuns} 轮：手动模式未检测到邮箱，等待粘贴后继续 ===`, 'warn');
+        }
+      } else {
+        while (!emailReady) {
+          try {
+            const burnerEmail = await fetchBurnerEmail({ generateNew: true });
+            await addLog(`=== 第 ${run}/${totalRuns} 轮：Burner 邮箱已就绪：${burnerEmail} ===`, 'ok');
+            emailReady = true;
+            autoRunResumeMode = null;
+          } catch (err) {
+            if (isBurnerChallengeError(err)) {
+              await waitForBurnerChallengeResolution(`Run ${run}/${totalRuns}`);
+              continue;
+            }
 
-          await addLog(`Burner Mailbox 自动获取失败：${err.message}`, 'warn');
-          break;
+            await addLog(`Burner Mailbox 自动获取失败：${err.message}`, 'warn');
+            break;
+          }
         }
       }
 
       if (!emailReady) {
-        await addLog(`=== 第 ${run}/${totalRuns} 轮已暂停：请获取 Burner Mailbox 邮箱或手动粘贴后继续 ===`, 'warn');
+        const waitHint = isManualModeRun
+          ? '手动模式请粘贴邮箱后点击“继续”'
+          : '点击“自动”获取 Burner Mailbox 邮箱，或手动粘贴后继续';
+        await addLog(
+          isManualModeRun
+            ? `=== 第 ${run}/${totalRuns} 轮已暂停：手动模式请粘贴邮箱后继续 ===`
+            : `=== 第 ${run}/${totalRuns} 轮已暂停：请获取 Burner Mailbox 邮箱或手动粘贴后继续 ===`,
+          'warn'
+        );
         autoRunResumeMode = 'email';
-        chrome.runtime.sendMessage(status('waiting_email')).catch(() => {});
+        chrome.runtime.sendMessage(status('waiting_email', { hint: waitHint })).catch(() => {});
 
         // Wait for RESUME_AUTO_RUN — sets a promise that resumeAutoRun resolves
         await waitForResume();
@@ -1562,7 +1647,20 @@ function getMailConfig(state) {
 
 function isNoMatchingEmailError(error) {
   const message = error?.message || String(error || '');
-  return message.includes('No matching verification email found') || message.includes('No new matching email found');
+  return message.includes('No matching verification email found')
+    || message.includes('No new matching email found')
+    || message.includes('未在 Burner Mailbox 中找到匹配的验证码邮件');
+}
+
+function getOtpPollingConfig(state) {
+  const waitSeconds = normalizeOtpWaitSeconds(state?.otpWaitSeconds);
+  const maxAttempts = Math.max(1, Math.ceil((waitSeconds * 1000) / OTP_POLL_INTERVAL_MS));
+  const resendEveryAttempts = Math.max(1, Math.ceil(OTP_RESEND_INTERVAL_MS / OTP_POLL_INTERVAL_MS));
+  return {
+    waitSeconds,
+    maxAttempts,
+    resendEveryAttempts,
+  };
 }
 
 async function openMailTab(mail) {
@@ -1626,16 +1724,20 @@ async function pollVerificationCodeWithRetry(step, state, options) {
 
   const mail = getMailConfig(state);
   if (mail.error) throw new Error(mail.error);
+  const polling = getOtpPollingConfig(state);
+  let remainingAttempts = polling.maxAttempts;
+  let scannedAttempts = 0;
 
-  const maxResendRounds = 3;
+  await addLog(`步骤 ${step}：验证码轮询窗口 ${polling.waitSeconds} 秒，每 ${OTP_POLL_INTERVAL_MS / 1000} 秒检测一次。`, 'info');
 
-  for (let round = 0; round <= maxResendRounds; round++) {
+  while (remainingAttempts > 0) {
     await addLog(`步骤 ${step}：正在打开 ${mail.label}...`);
     await openMailTab(mail);
 
-    let foundCode = null;
+    const chunkAttempts = Math.min(remainingAttempts, polling.resendEveryAttempts);
+    let result = null;
     try {
-      const result = await sendToContentScript(mail.source, {
+      result = await sendToContentScript(mail.source, {
         type: 'POLL_EMAIL',
         step,
         source: 'background',
@@ -1644,47 +1746,54 @@ async function pollVerificationCodeWithRetry(step, state, options) {
           senderFilters,
           subjectFilters,
           targetEmail,
-          maxAttempts: 2,
-          intervalMs: 4000,
+          maxAttempts: chunkAttempts,
+          intervalMs: OTP_POLL_INTERVAL_MS,
         },
       });
-
-      if (result?.error) {
-        throw new Error(result.error);
-      }
-
-      if (result?.code) {
-        if (result.emailTimestamp) {
-          await setState({ lastEmailTimestamp: result.emailTimestamp });
-        }
-        await addLog(successLogMessage(result.code), 'ok');
-        foundCode = result.code;
-      }
     } catch (err) {
       if (isBurnerChallengeError(err)) {
         await waitForBurnerChallengeResolution(`Step ${step}`);
-        round -= 1;
         continue;
       }
-      if (!isNoMatchingEmailError(err)) {
-        throw err;
+      throw err;
+    }
+
+    if (result?.error) {
+      const pollErr = new Error(result.error);
+      if (isBurnerChallengeError(pollErr)) {
+        await waitForBurnerChallengeResolution(`Step ${step}`);
+        continue;
+      }
+      if (!isNoMatchingEmailError(pollErr)) {
+        throw pollErr;
       }
     }
 
-    if (foundCode) {
-      return foundCode;
+    if (result?.code) {
+      if (result.emailTimestamp) {
+        await setState({ lastEmailTimestamp: result.emailTimestamp });
+      }
+      await addLog(successLogMessage(result.code), 'ok');
+      return result.code;
     }
 
-    if (round === maxResendRounds) {
-      throw new Error(`${failureLabel}，且已重发 3 轮。`);
+    scannedAttempts += chunkAttempts;
+    remainingAttempts -= chunkAttempts;
+
+    if (remainingAttempts <= 0) {
+      break;
     }
 
-    await addLog(`步骤 ${step}：4 秒内没有新邮件，正在请求重发两次（${round + 1}/${maxResendRounds}）...`, 'warn');
-    await requestVerificationEmailResend(step, 2);
-    await humanStepDelay(500, 1100);
+    await addLog(`步骤 ${step}：等待中，准备触发一次重新发送验证码（已检测 ${scannedAttempts}/${polling.maxAttempts} 次）。`, 'warn');
+    await requestVerificationEmailResend(step, 1);
+    await humanStepDelay(400, 900);
   }
 
-  throw new Error(failureLabel);
+  if (autoRunActive) {
+    await requestOtpTimeoutPause(step, state);
+  }
+
+  throw new Error(`${failureLabel}，在 ${polling.waitSeconds} 秒内未收到验证码。`);
 }
 
 async function executeStep4(state) {
