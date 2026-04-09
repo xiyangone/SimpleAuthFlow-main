@@ -107,3 +107,63 @@ test('核心流程日志与错误提示已至少完成基础汉化', () => {
     assert.equal(exists, false, `运行时脚本仍包含英文提示: ${token}`);
   }
 });
+
+test('手动模式核心闭环标识已接入', () => {
+  const sidepanelHtml = read('sidepanel/sidepanel.html');
+  const sidepanelJs = read('sidepanel/sidepanel.js');
+  const sidepanelCss = read('sidepanel/sidepanel.css');
+  const backgroundJs = read('background.js');
+
+  const requiredHtmlTokens = [
+    '自动模式',
+    '手动模式',
+    '提交并继续',
+    '等待输入验证码',
+    '6 位验证码',
+  ];
+
+  for (const token of requiredHtmlTokens) {
+    assert.equal(
+      sidepanelHtml.includes(token),
+      true,
+      `侧边栏 HTML 缺少手动模式文案: ${token}`
+    );
+  }
+
+  const requiredJsTokens = [
+    'SUBMIT_MANUAL_CODE',
+    'manual_code',
+    'select-run-mode',
+    'showManualCodeModal',
+  ];
+
+  for (const token of requiredJsTokens) {
+    assert.equal(
+      sidepanelJs.includes(token),
+      true,
+      `侧边栏脚本缺少手动模式关键标识: ${token}`
+    );
+  }
+
+  const requiredBackgroundTokens = [
+    'runMode',
+    'manualCodeEntry',
+    'SUBMIT_MANUAL_CODE',
+    'waiting_manual_code',
+    'RUN_MODE_MANUAL',
+  ];
+
+  for (const token of requiredBackgroundTokens) {
+    assert.equal(
+      backgroundJs.includes(token),
+      true,
+      `后台脚本缺少手动模式关键标识: ${token}`
+    );
+  }
+
+  assert.equal(
+    sidepanelCss.includes('.modal-shell'),
+    true,
+    '侧边栏样式缺少验证码弹层样式'
+  );
+});

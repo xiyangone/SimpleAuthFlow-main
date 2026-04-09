@@ -53,6 +53,13 @@
         <span class="data-value">Burner Mailbox</span>
       </div>
       <div class="data-row">
+        <span class="data-label">模式</span>
+        <select id="select-run-mode" class="data-select">
+          <option value="auto" selected>自动模式</option>
+          <option value="manual">手动模式</option>
+        </select>
+      </div>
+      <div class="data-row">
         <span class="data-label">邮箱</span>
         <div class="data-inline">
           <input type="text" id="input-email" class="data-input" placeholder="自动从 Burner Mailbox 获取，或手动粘贴" />
@@ -83,6 +90,20 @@
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
       <span id="auto-continue-hint" class="auto-hint">点击“自动”获取 Burner Mailbox 邮箱，或手动粘贴后继续</span>
       <button id="btn-auto-continue" class="btn btn-primary btn-sm">继续</button>
+    </div>
+    <div id="manual-code-modal" class="modal-shell" style="display:none;">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-header">
+          <span id="manual-code-title" class="section-label">等待输入验证码</span>
+        </div>
+        <p id="manual-code-hint" class="modal-hint">请输入验证码，提交后自动继续。</p>
+        <input type="text" id="input-manual-code" class="data-input mono" inputmode="numeric" maxlength="6" placeholder="6 位验证码" />
+        <div class="modal-actions">
+          <button id="btn-cancel-manual-code" class="btn btn-outline btn-sm" type="button">稍后再填</button>
+          <button id="btn-submit-manual-code" class="btn btn-primary btn-sm" type="button">提交并继续</button>
+        </div>
+      </div>
     </div>
   </section>
 

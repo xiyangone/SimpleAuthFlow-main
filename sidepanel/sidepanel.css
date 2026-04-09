@@ -382,6 +382,54 @@ header {
 .auto-continue-bar svg { color: var(--orange); flex-shrink: 0; }
 .auto-hint { font-size: 13px; color: var(--orange); flex: 1; font-weight: 500; }
 
+/* Manual Code Modal */
+.modal-shell {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(16, 24, 40, 0.5);
+}
+
+.modal-card {
+  position: relative;
+  width: calc(100% - 24px);
+  max-width: 360px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md), 0 14px 26px rgba(0, 0, 0, 0.18);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.modal-hint {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* ============================================================
    Steps Section
    ============================================================ */
