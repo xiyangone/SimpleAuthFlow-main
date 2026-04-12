@@ -50,7 +50,12 @@
       </div>
       <div class="data-row">
         <span class="data-label">邮箱服务</span>
-        <span class="data-value">Burner Mailbox</span>
+        <select id="select-email-provider" class="data-select">
+          <option value="burner_mailbox" selected>Burner Mailbox</option>
+          <option value="mail_2925">2925 邮箱</option>
+          <option value="qq_mail">QQ 邮箱</option>
+          <option value="mail_163">163 邮箱</option>
+        </select>
       </div>
       <div class="data-row">
         <span class="data-label">模式</span>
@@ -76,6 +81,13 @@
           <input type="password" id="input-password" class="data-input" placeholder="留空则自动生成" />
           <button id="btn-toggle-password" class="btn btn-outline btn-sm" type="button">显示</button>
         </div>
+      </div>
+      <div class="data-row data-check-row">
+        <span class="data-label">兜底</span>
+        <label class="data-check" for="input-auto-skip-failures">
+          <input type="checkbox" id="input-auto-skip-failures" />
+          <span>出错无法继续时丢弃当前线程并新开一轮，直到补足目标次数</span>
+        </label>
       </div>
       <div class="data-row">
         <span class="data-label">OAuth</span>
@@ -172,6 +184,21 @@
     </div>
     <div id="log-area"></div>
   </section>
+
+  <div id="auto-start-modal" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <div class="modal-header">
+        <span id="auto-start-title" class="modal-title">启动自动</span>
+        <button id="btn-auto-start-close" class="modal-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <p id="auto-start-message" class="modal-message">检测到已有流程进度，选择继续当前还是重新开始。</p>
+      <div class="modal-actions">
+        <button id="btn-auto-start-cancel" class="btn btn-ghost btn-sm" type="button">取消</button>
+        <button id="btn-auto-start-restart" class="btn btn-outline btn-sm" type="button">重新开始</button>
+        <button id="btn-auto-start-continue" class="btn btn-primary btn-sm" type="button">继续当前</button>
+      </div>
+    </div>
+  </div>
 
   <div id="toast-container"></div>
   <script src="sidepanel.js"></script>

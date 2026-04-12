@@ -1,9 +1,24 @@
 // background.js — Service Worker: orchestration, state, tab management, message routing
 
-importScripts('data/names.js');
+importScripts('data/names.js', 'shared/mail-2925.js', 'shared/verification-timing.js');
+
+const {
+  build2925ChildEmail = () => null,
+  is2925ChildEmailForMain = () => false,
+  parse2925MainEmail = () => null,
+} = globalThis.MultiPage2925Mail || {};
+
+const {
+  getStep4FilterAfterTimestamp = (state, fallback) => fallback || 0,
+  getStep7FilterAfterTimestamp = (state, fallback) => fallback || 0,
+} = globalThis.MultiPageVerificationTiming || {};
 
 const LOG_PREFIX = '[SimpleAuthFlow:bg]';
 const BURNER_MAILBOX_URL = 'https://burnermailbox.com/mailbox';
+const MAIL_2925_URL = 'https://www.2925.com/#/mailList';
+const DUCK_AUTOFILL_URL = 'https://duckduckgo.com/email/settings/autofill';
+const QQ_MAIL_URL = 'https://wx.mail.qq.com/';
+const MAIL_163_URL = 'https://mail.163.com/';
 const DEFAULT_VPS_URL = 'http://127.0.0.1:8317/management.html#/oauth';
 const BURNER_CHALLENGE_REQUIRED_MESSAGE = 'Burner Mailbox 需要进行安全验证。';
 const STOP_ERROR_MESSAGE = '流程已被用户停止。';
@@ -19,6 +34,10 @@ const OTP_RESEND_INTERVAL_MS = 20000;
 const DEFAULT_OTP_WAIT_SECONDS = 180;
 const MIN_OTP_WAIT_SECONDS = 30;
 const MAX_OTP_WAIT_SECONDS = 600;
+const EMAIL_PROVIDER_BURNER = 'burner_mailbox';
+const EMAIL_PROVIDER_2925 = 'mail_2925';
+const EMAIL_PROVIDER_QQ = 'qq_mail';
+const EMAIL_PROVIDER_163 = 'mail_163';
 
 initializeSessionStorageAccess();
 
@@ -47,8 +66,20 @@ const DEFAULT_STATE = {
   vpsUrl: '',
   customPassword: '',
   runMode: RUN_MODE_AUTO,
+  emailProvider: EMAIL_PROVIDER_BURNER,
+  mail2925MainEmail: null,
   manualCodeEntry: null,
   otpWaitSeconds: DEFAULT_OTP_WAIT_SECONDS,
+  step3StartTime: null,
+  step6StartTime: null,
+  lastSignupCode: null,
+  lastLoginCode: null,
+  autoRunSkipFailures: false,
+  autoRunning: false,
+  autoRunPhase: 'idle',
+  autoRunCurrentRun: 0,
+  autoRunTotalRuns: 1,
+  autoRunAttemptRun: 0,
 };
 
 async function getState() {
@@ -57,8 +88,16 @@ async function getState() {
   return {
     ...merged,
     runMode: normalizeRunMode(merged.runMode),
+    emailProvider: normalizeEmailProvider(merged.emailProvider),
+    mail2925MainEmail: parse2925MainEmail(merged.mail2925MainEmail)?.email || null,
     manualCodeEntry: merged.manualCodeEntry || null,
     otpWaitSeconds: normalizeOtpWaitSeconds(merged.otpWaitSeconds),
+    autoRunSkipFailures: Boolean(merged.autoRunSkipFailures),
+    autoRunning: Boolean(merged.autoRunning),
+    autoRunPhase: merged.autoRunPhase || 'idle',
+    autoRunCurrentRun: Number(merged.autoRunCurrentRun || 0),
+    autoRunTotalRuns: Number(merged.autoRunTotalRuns || 1),
+    autoRunAttemptRun: Number(merged.autoRunAttemptRun || 0),
   };
 }
 
@@ -113,10 +152,121 @@ function normalizeRunMode(value) {
   return String(value || '').trim() === RUN_MODE_MANUAL ? RUN_MODE_MANUAL : RUN_MODE_AUTO;
 }
 
+function normalizeEmailProvider(value) {
+  const normalized = String(value || '').trim();
+  if (normalized === EMAIL_PROVIDER_2925 || normalized === EMAIL_PROVIDER_QQ || normalized === EMAIL_PROVIDER_163) {
+    return normalized;
+  }
+  return EMAIL_PROVIDER_BURNER;
+}
+
 function normalizeOtpWaitSeconds(value) {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   if (!Number.isFinite(parsed)) return DEFAULT_OTP_WAIT_SECONDS;
   return Math.max(MIN_OTP_WAIT_SECONDS, Math.min(MAX_OTP_WAIT_SECONDS, parsed));
+}
+
+function getProviderDisplayName(provider) {
+  switch (normalizeEmailProvider(provider)) {
+    case EMAIL_PROVIDER_2925:
+      return '2925 邮箱';
+    case EMAIL_PROVIDER_QQ:
+      return 'QQ 邮箱';
+    case EMAIL_PROVIDER_163:
+      return '163 邮箱';
+    default:
+      return 'Burner Mailbox';
+  }
+}
+
+function getEmailFetchDisplayName(provider) {
+  switch (normalizeEmailProvider(provider)) {
+    case EMAIL_PROVIDER_2925:
+      return '2925 子邮箱';
+    case EMAIL_PROVIDER_QQ:
+    case EMAIL_PROVIDER_163:
+      return 'Duck 私有地址';
+    default:
+      return 'Burner Mailbox 邮箱';
+  }
+}
+
+function getEmailPauseHint(provider, mode) {
+  if (normalizeRunMode(mode) === RUN_MODE_MANUAL) {
+    return '手动模式请粘贴邮箱后点击“继续”';
+  }
+
+  switch (normalizeEmailProvider(provider)) {
+    case EMAIL_PROVIDER_2925:
+      return '点击“自动”识别 2925 主邮箱并生成子邮箱，或手动粘贴后继续';
+    case EMAIL_PROVIDER_QQ:
+    case EMAIL_PROVIDER_163:
+      return '点击“自动”生成 Duck 私有地址，或手动粘贴后继续';
+    default:
+      return '点击“自动”获取 Burner Mailbox 邮箱，或手动粘贴后继续';
+  }
+}
+
+function isStepDoneStatus(status) {
+  return status === 'completed' || status === 'skipped';
+}
+
+function hasSavedProgress(stepStatuses = {}) {
+  return Object.values(stepStatuses || {}).some((status) => status && status !== 'pending');
+}
+
+function getFirstUnfinishedStep(stepStatuses = {}) {
+  for (let step = 1; step <= 9; step++) {
+    if (!isStepDoneStatus(stepStatuses?.[step])) {
+      return step;
+    }
+  }
+  return null;
+}
+
+function getAutoRunStateUpdate(phase, payload = {}) {
+  const currentRun = Number(payload.currentRun || 0);
+  const totalRuns = Number(payload.totalRuns || 1);
+  const attemptRun = Number(payload.attemptRun || 0);
+  return {
+    autoRunning: phase !== 'idle' && phase !== 'stopped' && phase !== 'complete',
+    autoRunPhase: phase,
+    autoRunCurrentRun: currentRun,
+    autoRunTotalRuns: totalRuns,
+    autoRunAttemptRun: attemptRun,
+  };
+}
+
+async function broadcastAutoRunStatus(phase, payload = {}) {
+  await setState(getAutoRunStateUpdate(phase, payload));
+  chrome.runtime.sendMessage({
+    type: 'AUTO_RUN_STATUS',
+    payload: { phase, ...payload },
+  }).catch(() => {});
+}
+
+function isAutoRunLockedState(state) {
+  return Boolean(state?.autoRunning) && (state?.autoRunPhase === 'running' || state?.autoRunPhase === 'retrying');
+}
+
+function isAutoRunPausedState(state) {
+  return Boolean(state?.autoRunning) && (
+    state?.autoRunPhase === 'waiting_email'
+    || state?.autoRunPhase === 'waiting_challenge'
+    || state?.autoRunPhase === 'waiting_otp_timeout'
+    || state?.autoRunPhase === 'waiting_manual_code'
+  );
+}
+
+async function ensureManualInteractionAllowed(actionLabel) {
+  const state = await getState();
+  if (isAutoRunLockedState(state)) {
+    throw new Error(`自动流程运行中，请先停止后再${actionLabel}。`);
+  }
+  if (isAutoRunPausedState(state)) {
+    throw new Error(`自动流程当前已暂停。请点击“继续”，或先确认接管自动流程后再${actionLabel}。`);
+  }
+  return state;
 }
 
 function isManualRunMode(state) {
@@ -159,6 +309,11 @@ async function setPasswordState(password) {
   broadcastDataUpdate({ password });
 }
 
+async function set2925MainEmailState(email) {
+  const normalizedEmail = parse2925MainEmail(email)?.email || null;
+  await setState({ mail2925MainEmail: normalizedEmail });
+}
+
 async function resetState() {
   console.log(LOG_PREFIX, 'Resetting all state');
   // Preserve settings and persistent data across resets
@@ -166,12 +321,16 @@ async function resetState() {
     'seenCodes',
     'seenInbucketMailIds',
     'seenBurnerMailIds',
+    'seen2925Codes',
     'accounts',
     'tabRegistry',
     'vpsUrl',
     'customPassword',
     'runMode',
+    'emailProvider',
+    'mail2925MainEmail',
     'otpWaitSeconds',
+    'autoRunSkipFailures',
   ]);
   await chrome.storage.session.clear();
   await chrome.storage.session.set({
@@ -179,13 +338,22 @@ async function resetState() {
     seenCodes: prev.seenCodes || [],
     seenInbucketMailIds: prev.seenInbucketMailIds || [],
     seenBurnerMailIds: prev.seenBurnerMailIds || [],
+    seen2925Codes: prev.seen2925Codes || [],
     accounts: prev.accounts || [],
     tabRegistry: prev.tabRegistry || {},
     vpsUrl: prev.vpsUrl || '',
     customPassword: prev.customPassword || '',
     runMode: normalizeRunMode(prev.runMode),
+    emailProvider: normalizeEmailProvider(prev.emailProvider),
+    mail2925MainEmail: parse2925MainEmail(prev.mail2925MainEmail)?.email || null,
     manualCodeEntry: null,
     otpWaitSeconds: normalizeOtpWaitSeconds(prev.otpWaitSeconds),
+    autoRunSkipFailures: Boolean(prev.autoRunSkipFailures),
+    autoRunning: false,
+    autoRunPhase: 'idle',
+    autoRunCurrentRun: 0,
+    autoRunTotalRuns: 1,
+    autoRunAttemptRun: 0,
   });
 }
 
@@ -534,9 +702,13 @@ async function sleepWithStop(ms) {
   }
 }
 
-async function humanStepDelay(min = HUMAN_STEP_DELAY_MIN, max = HUMAN_STEP_DELAY_MAX) {
+async function humanStepDelay(min = HUMAN_STEP_DELAY_MIN, max = HUMAN_STEP_DELAY_MAX, onSelected = null) {
   const duration = Math.floor(Math.random() * (max - min + 1)) + min;
+  if (typeof onSelected === 'function') {
+    await onSelected(duration);
+  }
   await sleepWithStop(duration);
+  return duration;
 }
 
 async function clickWithDebugger(tabId, rect) {
@@ -694,7 +866,16 @@ async function handleMessage(message, sender) {
     case 'AUTO_RUN': {
       clearStopRequest();
       const totalRuns = message.payload?.totalRuns || 1;
-      autoRunLoop(totalRuns);  // fire-and-forget
+      const mode = message.payload?.mode === 'continue' ? 'continue' : 'restart';
+      const autoRunSkipFailures = Boolean(message.payload?.autoRunSkipFailures);
+      autoRunLoop(totalRuns, { mode, autoRunSkipFailures }).catch((err) => {
+        addLog(`自动流程异常终止：${err.message}`, 'error').catch(() => {});
+        broadcastAutoRunStatus('stopped', {
+          currentRun: autoRunCurrentRun,
+          totalRuns: autoRunTotalRuns,
+          attemptRun: autoRunAttemptRun,
+        }).catch(() => {});
+      });
       return { ok: true };
     }
 
@@ -712,13 +893,21 @@ async function handleMessage(message, sender) {
       if (message.payload.vpsUrl !== undefined) updates.vpsUrl = normalizeVpsUrl(message.payload.vpsUrl);
       if (message.payload.customPassword !== undefined) updates.customPassword = message.payload.customPassword;
       if (message.payload.runMode !== undefined) updates.runMode = normalizeRunMode(message.payload.runMode);
+      if (message.payload.emailProvider !== undefined) updates.emailProvider = normalizeEmailProvider(message.payload.emailProvider);
       if (message.payload.otpWaitSeconds !== undefined) updates.otpWaitSeconds = normalizeOtpWaitSeconds(message.payload.otpWaitSeconds);
+      if (message.payload.autoRunSkipFailures !== undefined) updates.autoRunSkipFailures = Boolean(message.payload.autoRunSkipFailures);
       await setState(updates);
       if (Object.prototype.hasOwnProperty.call(updates, 'runMode')) {
         broadcastDataUpdate({ runMode: updates.runMode });
       }
+      if (Object.prototype.hasOwnProperty.call(updates, 'emailProvider')) {
+        broadcastDataUpdate({ emailProvider: updates.emailProvider });
+      }
       if (Object.prototype.hasOwnProperty.call(updates, 'otpWaitSeconds')) {
         broadcastDataUpdate({ otpWaitSeconds: updates.otpWaitSeconds });
+      }
+      if (Object.prototype.hasOwnProperty.call(updates, 'autoRunSkipFailures')) {
+        broadcastDataUpdate({ autoRunSkipFailures: updates.autoRunSkipFailures });
       }
       return { ok: true };
     }
@@ -733,21 +922,50 @@ async function handleMessage(message, sender) {
       return await submitManualCodeAndContinue(message.payload || {});
     }
 
+    case 'FETCH_PROVIDER_EMAIL': {
+      clearStopRequest();
+      const email = await fetchProviderEmail(message.payload || {});
+      return { ok: true, email };
+    }
+
+    case 'CONTINUE_PROVIDER_FETCH': {
+      clearStopRequest();
+      const email = await continueProviderFetch(message.payload || {});
+      return { ok: true, email };
+    }
+
     case 'FETCH_BURNER_EMAIL': {
       clearStopRequest();
-      const email = await fetchBurnerEmail(message.payload || {});
+      const email = await fetchProviderEmail({
+        ...(message.payload || {}),
+        provider: EMAIL_PROVIDER_BURNER,
+      });
       return { ok: true, email };
     }
 
     case 'CONTINUE_BURNER_AFTER_CHALLENGE': {
       clearStopRequest();
-      const email = await continueBurnerAfterChallenge(message.payload || {});
+      const email = await continueProviderFetch({
+        ...(message.payload || {}),
+        provider: EMAIL_PROVIDER_BURNER,
+      });
       return { ok: true, email };
     }
 
     case 'STOP_FLOW': {
       await requestStop();
       return { ok: true };
+    }
+
+    case 'TAKEOVER_AUTO_RUN': {
+      await requestStop({ logMessage: '已确认手动接管，正在停止自动流程并切换为手动控制...' });
+      await addLog('自动流程已切换为手动控制。', 'warn');
+      return { ok: true };
+    }
+
+    case 'SKIP_STEP': {
+      const step = Number(message.payload?.step);
+      return await skipStep(step);
     }
 
     default:
@@ -829,7 +1047,42 @@ async function markRunningStepsStopped() {
   }
 }
 
-async function requestStop() {
+async function skipStep(step) {
+  const state = await ensureManualInteractionAllowed('跳过步骤');
+
+  if (!Number.isInteger(step) || step < 1 || step > 9) {
+    throw new Error(`无效步骤：${step}`);
+  }
+
+  const statuses = { ...(state.stepStatuses || {}) };
+  const currentStatus = statuses[step];
+  if (currentStatus === 'running') {
+    throw new Error(`步骤 ${step} 正在运行中，不能跳过。`);
+  }
+  if (isStepDoneStatus(currentStatus)) {
+    throw new Error(`步骤 ${step} 已完成，无需再跳过。`);
+  }
+
+  if (step > 1 && !isStepDoneStatus(statuses[step - 1])) {
+    throw new Error(`请先完成步骤 ${step - 1}，再跳过步骤 ${step}。`);
+  }
+
+  await setStepStatus(step, 'skipped');
+  await addLog(`步骤 ${step} 已跳过`, 'warn');
+
+  if (step === 1) {
+    const latestState = await getState();
+    const step2Status = latestState.stepStatuses?.[2];
+    if (!isStepDoneStatus(step2Status) && step2Status !== 'running') {
+      await setStepStatus(2, 'skipped');
+      await addLog('步骤 1 已跳过，步骤 2 也已同时跳过。', 'warn');
+    }
+  }
+
+  return { ok: true, step, status: 'skipped' };
+}
+
+async function requestStop(options = {}) {
   if (stopRequested) return;
 
   stopRequested = true;
@@ -839,7 +1092,7 @@ async function requestStop() {
     webNavListener = null;
   }
 
-  await addLog('已请求停止，正在取消当前操作...', 'warn');
+  await addLog(options.logMessage || '已请求停止，正在取消当前操作...', 'warn');
   await broadcastStopToContentScripts();
 
   for (const waiter of stepWaiters.values()) {
@@ -857,11 +1110,11 @@ async function requestStop() {
 
   await markRunningStepsStopped();
   autoRunActive = false;
-  await setState({ autoRunning: false });
-  chrome.runtime.sendMessage({
-    type: 'AUTO_RUN_STATUS',
-    payload: { phase: 'stopped', currentRun: autoRunCurrentRun, totalRuns: autoRunTotalRuns },
-  }).catch(() => {});
+  await broadcastAutoRunStatus('stopped', {
+    currentRun: autoRunCurrentRun,
+    totalRuns: autoRunTotalRuns,
+    attemptRun: autoRunAttemptRun,
+  });
 }
 
 async function requestManualCodePause(step) {
@@ -870,17 +1123,13 @@ async function requestManualCodePause(step) {
   await setStepStatus(step, 'stopped');
   await addLog(`步骤 ${step}：等待输入验证码后继续。`, 'warn');
   broadcastDataUpdate({ manualCodeEntry: entry });
-
-  chrome.runtime.sendMessage({
-    type: 'AUTO_RUN_STATUS',
-    payload: {
-      phase: 'waiting_manual_code',
-      currentRun: autoRunCurrentRun,
-      totalRuns: autoRunTotalRuns,
-      step,
-      manualCodeEntry: entry,
-    },
-  }).catch(() => {});
+  await broadcastAutoRunStatus('waiting_manual_code', {
+    currentRun: autoRunCurrentRun,
+    totalRuns: autoRunTotalRuns,
+    attemptRun: autoRunAttemptRun,
+    step,
+    manualCodeEntry: entry,
+  });
 
   if (autoRunActive) {
     autoRunResumeMode = 'manual_code';
@@ -890,19 +1139,17 @@ async function requestManualCodePause(step) {
 
 async function requestOtpTimeoutPause(step, state) {
   const waitSeconds = normalizeOtpWaitSeconds(state?.otpWaitSeconds);
+  const providerLabel = getProviderDisplayName(state?.emailProvider);
   await setStepStatus(step, 'stopped');
-  await addLog(`步骤 ${step}：等待验证码超时（${waitSeconds} 秒），点击“继续”后将再次轮询并重发。`, 'warn');
-  chrome.runtime.sendMessage({
-    type: 'AUTO_RUN_STATUS',
-    payload: {
-      phase: 'waiting_otp_timeout',
-      currentRun: autoRunCurrentRun,
-      totalRuns: autoRunTotalRuns,
-      step,
-      waitSeconds,
-      hint: `验证码等待超时（${waitSeconds} 秒），点击“继续”后再次轮询并重发。`,
-    },
-  }).catch(() => {});
+  await addLog(`步骤 ${step}：等待 ${providerLabel} 验证码超时（${waitSeconds} 秒），点击“继续”后将再次轮询并重发。`, 'warn');
+  await broadcastAutoRunStatus('waiting_otp_timeout', {
+    currentRun: autoRunCurrentRun,
+    totalRuns: autoRunTotalRuns,
+    attemptRun: autoRunAttemptRun,
+    step,
+    waitSeconds,
+    hint: `${providerLabel} 验证码等待超时（${waitSeconds} 秒），点击“继续”后再次轮询并重发。`,
+  });
 
   if (autoRunActive) {
     autoRunResumeMode = 'otp_timeout';
@@ -1151,20 +1398,127 @@ async function continueBurnerAfterChallenge(options = {}) {
   return await fetchBurnerEmail({ generateNew });
 }
 
+async function fetchDuckEmail(options = {}) {
+  throwIfStopped();
+  const { generateNew = true } = options;
+
+  await addLog(`Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
+  await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL);
+
+  const result = await sendToContentScript('duck-mail', {
+    type: 'FETCH_DUCK_EMAIL',
+    source: 'background',
+    payload: { generateNew },
+  });
+
+  if (result?.error) {
+    throw new Error(result.error);
+  }
+  if (!result?.email) {
+    throw new Error('未返回 Duck 私有地址。');
+  }
+
+  await setEmailState(result.email);
+  await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
+  return result.email;
+}
+
+async function fetch2925MainEmailFromPage() {
+  throwIfStopped();
+  await addLog('2925 邮箱：正在打开页面识别主邮箱...', 'info');
+  await reuseOrCreateTab('mail-2925', MAIL_2925_URL, {
+    reloadIfSameUrl: true,
+  });
+
+  const result = await sendToContentScript('mail-2925', {
+    type: 'FETCH_2925_MAIN_EMAIL',
+    source: 'background',
+    payload: {},
+  });
+
+  if (result?.error) {
+    throw new Error(result.error);
+  }
+
+  const mainMailbox = parse2925MainEmail(result?.email || '');
+  if (!mainMailbox?.email) {
+    throw new Error('当前页面未识别到有效的 2925 主邮箱，请确认页面已完全加载后重试。');
+  }
+
+  await set2925MainEmailState(mainMailbox.email);
+
+  if (result?.detectionMode === 'fallback') {
+    await addLog(`2925 邮箱：未识别到账号区，已回退使用第一个合法主邮箱 ${mainMailbox.email}`, 'warn');
+  } else {
+    await addLog(`2925 邮箱：已识别主邮箱 ${mainMailbox.email}`, 'ok');
+  }
+
+  return {
+    ...mainMailbox,
+    detectionMode: result?.detectionMode || 'preferred',
+  };
+}
+
+async function fetch2925ChildEmail(options = {}) {
+  throwIfStopped();
+  const { generateNew = true } = options;
+  const state = await getState();
+  const knownMainMailbox = parse2925MainEmail(options.mainEmail || state.mail2925MainEmail || '');
+  const mainMailbox = knownMainMailbox || await fetch2925MainEmailFromPage();
+
+  if (!generateNew && state.email && is2925ChildEmailForMain(state.email, mainMailbox.email)) {
+    await addLog(`2925 邮箱：复用现有子邮箱 ${state.email}`, 'info');
+    return state.email;
+  }
+
+  const result = build2925ChildEmail(mainMailbox.email);
+  if (!result?.childEmail) {
+    throw new Error('2925 主邮箱获取失败，无法生成子邮箱。');
+  }
+
+  await set2925MainEmailState(mainMailbox.email);
+  await setEmailState(result.childEmail);
+  await addLog(`2925 邮箱：已基于主邮箱 ${mainMailbox.email} 生成子邮箱 ${result.childEmail}`, 'ok');
+  return result.childEmail;
+}
+
+async function fetchProviderEmail(options = {}) {
+  const state = await getState();
+  const provider = normalizeEmailProvider(options.provider || state.emailProvider);
+
+  if (provider === EMAIL_PROVIDER_2925) {
+    return fetch2925ChildEmail(options);
+  }
+
+  if (provider === EMAIL_PROVIDER_QQ || provider === EMAIL_PROVIDER_163) {
+    return fetchDuckEmail(options);
+  }
+
+  return fetchBurnerEmail(options);
+}
+
+async function continueProviderFetch(options = {}) {
+  const state = await getState();
+  const provider = normalizeEmailProvider(options.provider || state.emailProvider);
+
+  if (provider === EMAIL_PROVIDER_BURNER) {
+    return continueBurnerAfterChallenge(options);
+  }
+
+  return fetchProviderEmail({ ...options, provider });
+}
+
 async function waitForBurnerChallengeResolution(contextLabel = 'Burner Mailbox') {
   let challengeResolved = false;
 
   while (!challengeResolved) {
     await addLog(`${contextLabel}: 检测到 Burner Mailbox 人机验证。请在邮箱页完成验证后点击“继续”`, 'warn');
     autoRunResumeMode = 'challenge';
-    chrome.runtime.sendMessage({
-      type: 'AUTO_RUN_STATUS',
-      payload: {
-        phase: 'waiting_challenge',
-        currentRun: Math.max(1, autoRunCurrentRun || 1),
-        totalRuns: Math.max(1, autoRunTotalRuns || 1),
-      },
-    }).catch(() => {});
+    await broadcastAutoRunStatus('waiting_challenge', {
+      currentRun: Math.max(1, autoRunCurrentRun || 1),
+      totalRuns: Math.max(1, autoRunTotalRuns || 1),
+      attemptRun: Math.max(0, autoRunAttemptRun || 0),
+    });
     await waitForResume();
 
     await addLog('Burner Mailbox: 正在等待人机验证页面结束...', 'info');
@@ -1388,9 +1742,143 @@ async function fetchBurnerEmail(options = {}) {
 let autoRunActive = false;
 let autoRunCurrentRun = 0;
 let autoRunTotalRuns = 1;
+let autoRunAttemptRun = 0;
 
-// Outer loop: runs the full flow N times
-async function autoRunLoop(totalRuns) {
+function buildAutoRunKeepSettings(state, payload = {}, options = {}) {
+  const runMode = normalizeRunMode(state?.runMode);
+  const keepSettings = {
+    vpsUrl: state?.vpsUrl || '',
+    customPassword: state?.customPassword || '',
+    runMode,
+    emailProvider: normalizeEmailProvider(state?.emailProvider),
+    mail2925MainEmail: parse2925MainEmail(state?.mail2925MainEmail)?.email || null,
+    manualCodeEntry: null,
+    otpWaitSeconds: normalizeOtpWaitSeconds(state?.otpWaitSeconds),
+    autoRunSkipFailures: Boolean(state?.autoRunSkipFailures),
+    ...getAutoRunStateUpdate('running', payload),
+  };
+
+  if (runMode === RUN_MODE_MANUAL && state?.email) {
+    keepSettings.email = state.email;
+  }
+  if (options.discardThread) {
+    keepSettings.tabRegistry = {};
+  }
+  return keepSettings;
+}
+
+async function runAutoSequenceFromStep(startStep, context = {}) {
+  const { targetRun, totalRuns, attemptRun, continued = false } = context;
+  const state = await getState();
+  const runMode = normalizeRunMode(state.runMode);
+  const isManualModeRun = runMode === RUN_MODE_MANUAL;
+  const provider = normalizeEmailProvider(state.emailProvider);
+
+  if (continued) {
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续当前进度，从步骤 ${startStep} 开始（第 ${attemptRun} 次尝试）===`, 'info');
+  } else {
+    await addLog(`=== 第 ${targetRun}/${totalRuns} 轮：阶段 1，获取 OAuth 链接并打开注册页（第 ${attemptRun} 次尝试）===`, 'info');
+  }
+
+  if (startStep <= 1) {
+    await executeStepAndWait(1, 2000);
+  }
+  if (startStep <= 2) {
+    await executeStepAndWait(2, 2000);
+  }
+
+  if (startStep <= 3) {
+    let emailReady = false;
+    const currentState = await getState();
+    if (currentState.email) {
+      emailReady = true;
+      await addLog(`=== 第 ${targetRun}/${totalRuns} 轮：当前邮箱已就绪：${currentState.email} ===`, 'ok');
+    } else if (isManualModeRun) {
+      await addLog(`=== 第 ${targetRun}/${totalRuns} 轮：手动模式未检测到邮箱，等待粘贴后继续 ===`, 'warn');
+    } else {
+      while (!emailReady) {
+        try {
+          const preparedEmail = await fetchProviderEmail({
+            generateNew: true,
+            provider,
+          });
+          await addLog(`=== 第 ${targetRun}/${totalRuns} 轮：${getEmailFetchDisplayName(provider)}已就绪：${preparedEmail} ===`, 'ok');
+          emailReady = true;
+          autoRunResumeMode = null;
+        } catch (err) {
+          if (isBurnerChallengeError(err)) {
+            await waitForBurnerChallengeResolution(`Run ${targetRun}/${totalRuns}`);
+            continue;
+          }
+
+          await addLog(`${getEmailFetchDisplayName(provider)}自动获取失败：${err.message}`, 'warn');
+          break;
+        }
+      }
+    }
+
+    if (!emailReady) {
+      const waitHint = getEmailPauseHint(provider, runMode);
+      await addLog(
+        isManualModeRun
+          ? `=== 第 ${targetRun}/${totalRuns} 轮已暂停：手动模式请粘贴邮箱后继续 ===`
+          : `=== 第 ${targetRun}/${totalRuns} 轮已暂停：请获取 ${getEmailFetchDisplayName(provider)}或手动粘贴后继续 ===`,
+        'warn'
+      );
+      autoRunResumeMode = 'email';
+      await broadcastAutoRunStatus('waiting_email', {
+        currentRun: targetRun,
+        totalRuns,
+        attemptRun,
+        hint: waitHint,
+      });
+      await waitForResume();
+
+      const resumedState = await getState();
+      if (!resumedState.email) {
+        throw new Error('无法继续：缺少邮箱地址。');
+      }
+      autoRunResumeMode = null;
+    }
+
+    await addLog(`=== 第 ${targetRun}/${totalRuns} 轮：阶段 2，注册、验证、登录并完成流程 ===`, 'info');
+    await broadcastAutoRunStatus('running', {
+      currentRun: targetRun,
+      totalRuns,
+      attemptRun,
+    });
+
+    const signupTabId = await getTabId('signup-page');
+    if (signupTabId) {
+      await chrome.tabs.update(signupTabId, { active: true });
+    }
+
+    await executeStepAndWait(3, 3000);
+  } else {
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续执行剩余流程（第 ${attemptRun} 次尝试）===`, 'info');
+  }
+
+  const signupTabId = await getTabId('signup-page');
+  if (signupTabId) {
+    await chrome.tabs.update(signupTabId, { active: true });
+  }
+
+  const stepDelays = {
+    4: 2000,
+    5: 3000,
+    6: 3000,
+    7: 2000,
+    8: 2000,
+    9: 1000,
+  };
+
+  for (let step = Math.max(startStep, 4); step <= 9; step++) {
+    await executeStepAndWait(step, stepDelays[step] || 2000);
+  }
+}
+
+// AUTO_RUN payload mode: 'restart' | 'continue'
+async function autoRunLoop(totalRuns, options = {}) {
   if (autoRunActive) {
     await addLog('自动运行已在进行中', 'warn');
     return;
@@ -1399,147 +1887,161 @@ async function autoRunLoop(totalRuns) {
   clearStopRequest();
   autoRunActive = true;
   autoRunTotalRuns = totalRuns;
+  autoRunCurrentRun = 0;
+  autoRunAttemptRun = 0;
+
   let successfulRuns = 0;
-  let failedRun = null;
-  await setState({ autoRunning: true });
+  let attemptRuns = 0;
+  const restartRequested = options.mode === 'restart';
+  let continueCurrentOnFirstAttempt = !restartRequested && options.mode === 'continue';
+  let discardCurrentThreadNextAttempt = false;
+  const autoRunSkipFailures = Boolean(options.autoRunSkipFailures);
+  const maxAttempts = autoRunSkipFailures ? Math.max(totalRuns * 10, totalRuns + 20) : totalRuns;
 
-  for (let run = 1; run <= totalRuns; run++) {
-    autoRunCurrentRun = run;
+  await setState({
+    autoRunSkipFailures,
+    ...getAutoRunStateUpdate('running', { currentRun: 0, totalRuns, attemptRun: 0 }),
+  });
 
-    // Reset everything at the start of each run (keep VPS/password settings)
-    const prevState = await getState();
-    const runMode = normalizeRunMode(prevState.runMode);
-    const isManualModeRun = runMode === RUN_MODE_MANUAL;
-    const keepSettings = {
-      vpsUrl: prevState.vpsUrl,
-      customPassword: prevState.customPassword,
-      runMode,
-      manualCodeEntry: null,
-      otpWaitSeconds: normalizeOtpWaitSeconds(prevState.otpWaitSeconds),
-      autoRunning: true,
-    };
-    if (isManualModeRun && prevState.email) {
-      keepSettings.email = prevState.email;
+  while (successfulRuns < totalRuns && attemptRuns < maxAttempts) {
+    attemptRuns += 1;
+    const targetRun = successfulRuns + 1;
+    autoRunCurrentRun = targetRun;
+    autoRunAttemptRun = attemptRuns;
+
+    let startStep = 1;
+    let useExistingProgress = false;
+
+    if (continueCurrentOnFirstAttempt) {
+      const currentState = await getState();
+      const resumeStep = getFirstUnfinishedStep(currentState.stepStatuses);
+      if (resumeStep && hasSavedProgress(currentState.stepStatuses)) {
+        startStep = resumeStep;
+        useExistingProgress = true;
+        await setState({
+          autoRunSkipFailures,
+          ...getAutoRunStateUpdate('running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
+        });
+      } else if (hasSavedProgress(currentState.stepStatuses)) {
+        await addLog('当前流程已全部处理，将按“重新开始”新开一轮自动运行。', 'info');
+      }
+      continueCurrentOnFirstAttempt = false;
     }
-    await resetState();
-    await setState(keepSettings);
-    // Tell side panel to reset all UI
-    chrome.runtime.sendMessage({ type: 'AUTO_RUN_RESET' }).catch(() => {});
-    await sleepWithStop(500);
 
-    await addLog(`=== 自动运行 ${run}/${totalRuns}：阶段 1，获取 OAuth 链接并打开注册页 ===`, 'info');
-    const status = (phase, payload = {}) => ({
-      type: 'AUTO_RUN_STATUS',
-      payload: { phase, currentRun: run, totalRuns, ...payload },
-    });
+    if (!useExistingProgress) {
+      const prevState = await getState();
+      await resetState();
+      await setState(buildAutoRunKeepSettings(prevState, {
+        currentRun: targetRun,
+        totalRuns,
+        attemptRun: attemptRuns,
+      }, {
+        discardThread: discardCurrentThreadNextAttempt,
+      }));
+      chrome.runtime.sendMessage({ type: 'AUTO_RUN_RESET' }).catch(() => {});
+      await sleepWithStop(500);
+    } else {
+      await setState({
+        autoRunSkipFailures,
+        ...getAutoRunStateUpdate('running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
+      });
+    }
+
+    if (discardCurrentThreadNextAttempt) {
+      await addLog(`兜底模式：上一轮已放弃，当前开始第 ${attemptRuns} 次尝试，将使用新线程继续补足第 ${targetRun}/${totalRuns} 轮。`, 'warn');
+      discardCurrentThreadNextAttempt = false;
+    }
 
     try {
       throwIfStopped();
-      chrome.runtime.sendMessage(status('running')).catch(() => {});
+      await broadcastAutoRunStatus('running', {
+        currentRun: targetRun,
+        totalRuns,
+        attemptRun: attemptRuns,
+      });
 
-      await executeStepAndWait(1, 2000);
-      await executeStepAndWait(2, 2000);
+      await runAutoSequenceFromStep(startStep, {
+        targetRun,
+        totalRuns,
+        attemptRun: attemptRuns,
+        continued: useExistingProgress,
+      });
 
-      let emailReady = false;
-      if (isManualModeRun) {
-        const manualState = await getState();
-        if (manualState.email) {
-          await addLog(`=== 第 ${run}/${totalRuns} 轮：手动模式邮箱已就绪：${manualState.email} ===`, 'ok');
-          emailReady = true;
-          autoRunResumeMode = null;
-        } else {
-          await addLog(`=== 第 ${run}/${totalRuns} 轮：手动模式未检测到邮箱，等待粘贴后继续 ===`, 'warn');
-        }
-      } else {
-        while (!emailReady) {
-          try {
-            const burnerEmail = await fetchBurnerEmail({ generateNew: true });
-            await addLog(`=== 第 ${run}/${totalRuns} 轮：Burner 邮箱已就绪：${burnerEmail} ===`, 'ok');
-            emailReady = true;
-            autoRunResumeMode = null;
-          } catch (err) {
-            if (isBurnerChallengeError(err)) {
-              await waitForBurnerChallengeResolution(`Run ${run}/${totalRuns}`);
-              continue;
-            }
-
-            await addLog(`Burner Mailbox 自动获取失败：${err.message}`, 'warn');
-            break;
-          }
-        }
-      }
-
-      if (!emailReady) {
-        const waitHint = isManualModeRun
-          ? '手动模式请粘贴邮箱后点击“继续”'
-          : '点击“自动”获取 Burner Mailbox 邮箱，或手动粘贴后继续';
-        await addLog(
-          isManualModeRun
-            ? `=== 第 ${run}/${totalRuns} 轮已暂停：手动模式请粘贴邮箱后继续 ===`
-            : `=== 第 ${run}/${totalRuns} 轮已暂停：请获取 Burner Mailbox 邮箱或手动粘贴后继续 ===`,
-          'warn'
-        );
-        autoRunResumeMode = 'email';
-        chrome.runtime.sendMessage(status('waiting_email', { hint: waitHint })).catch(() => {});
-
-        // Wait for RESUME_AUTO_RUN — sets a promise that resumeAutoRun resolves
-        await waitForResume();
-
-        const resumedState = await getState();
-        if (!resumedState.email) {
-          await addLog('无法继续：缺少邮箱地址。', 'error');
-          break;
-        }
-        autoRunResumeMode = null;
-      }
-
-      await addLog(`=== 第 ${run}/${totalRuns} 轮：阶段 2，注册、验证、登录并完成流程 ===`, 'info');
-      chrome.runtime.sendMessage(status('running')).catch(() => {});
-
-      const signupTabId = await getTabId('signup-page');
-      if (signupTabId) {
-        await chrome.tabs.update(signupTabId, { active: true });
-      }
-
-      await executeStepAndWait(3, 3000);
-      await executeStepAndWait(4, 2000);
-      await executeStepAndWait(5, 3000);
-      await executeStepAndWait(6, 3000);
-      await executeStepAndWait(7, 2000);
-      await executeStepAndWait(8, 2000);
-      await executeStepAndWait(9, 1000);
-
-      successfulRuns = run;
-      await addLog(`=== 第 ${run}/${totalRuns} 轮已完成 ===`, 'ok');
-
+      successfulRuns += 1;
+      await addLog(`=== 第 ${targetRun}/${totalRuns} 轮已完成（第 ${attemptRuns} 次尝试成功）===`, 'ok');
     } catch (err) {
       if (isStopError(err)) {
-        await addLog(`第 ${run}/${totalRuns} 轮已被用户停止`, 'warn');
-      } else {
-        failedRun = run;
-        await addLog(`第 ${run}/${totalRuns} 轮失败：${err.message}`, 'error');
+        await addLog(`目标 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
+        await broadcastAutoRunStatus('stopped', {
+          currentRun: successfulRuns,
+          totalRuns,
+          attemptRun: attemptRuns,
+        });
+        break;
       }
-      chrome.runtime.sendMessage(status('stopped')).catch(() => {});
-      break; // Stop on error
+
+      if (!autoRunSkipFailures) {
+        await addLog(`目标 ${targetRun}/${totalRuns} 轮失败：${err.message}`, 'error');
+        await broadcastAutoRunStatus('stopped', {
+          currentRun: successfulRuns,
+          totalRuns,
+          attemptRun: attemptRuns,
+        });
+        break;
+      }
+
+      await addLog(`目标 ${targetRun}/${totalRuns} 轮的第 ${attemptRuns} 次尝试失败：${err.message}`, 'error');
+      await addLog('兜底开关已开启：将放弃当前线程，重新开一轮继续补足目标次数。', 'warn');
+      cancelPendingCommands('当前尝试已放弃。');
+      await broadcastStopToContentScripts();
+      await broadcastAutoRunStatus('retrying', {
+        currentRun: targetRun,
+        totalRuns,
+        attemptRun: attemptRuns,
+      });
+      discardCurrentThreadNextAttempt = true;
+      continue;
     }
   }
 
-  const completedRuns = successfulRuns;
-  if (stopRequested) {
-    await addLog(`=== 已停止，完成 ${completedRuns}/${autoRunTotalRuns} 轮 ===`, 'warn');
-    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'stopped', currentRun: completedRuns, totalRuns: autoRunTotalRuns } }).catch(() => {});
-  } else if (failedRun !== null) {
-    await addLog(`=== 运行失败，已完成 ${completedRuns}/${autoRunTotalRuns} 轮 ===`, 'error');
-    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'stopped', currentRun: completedRuns, totalRuns: autoRunTotalRuns } }).catch(() => {});
-  } else if (completedRuns >= autoRunTotalRuns) {
-    await addLog(`=== 全部 ${autoRunTotalRuns} 轮已成功完成 ===`, 'ok');
-    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'complete', currentRun: completedRuns, totalRuns: autoRunTotalRuns } }).catch(() => {});
+  if (!stopRequested && autoRunSkipFailures && successfulRuns < totalRuns && attemptRuns >= maxAttempts) {
+    await addLog(`已达到安全重试上限（${attemptRuns} 次尝试），当前仅完成 ${successfulRuns}/${totalRuns} 轮。`, 'error');
+    await broadcastAutoRunStatus('stopped', {
+      currentRun: successfulRuns,
+      totalRuns: autoRunTotalRuns,
+      attemptRun: attemptRuns,
+    });
+  } else if (stopRequested) {
+    await addLog(`=== 已停止，完成 ${successfulRuns}/${autoRunTotalRuns} 轮，共尝试 ${attemptRuns} 次 ===`, 'warn');
+    await broadcastAutoRunStatus('stopped', {
+      currentRun: successfulRuns,
+      totalRuns: autoRunTotalRuns,
+      attemptRun: attemptRuns,
+    });
+  } else if (successfulRuns >= autoRunTotalRuns) {
+    await addLog(`=== 全部 ${autoRunTotalRuns} 轮均已成功完成，共尝试 ${attemptRuns} 次 ===`, 'ok');
+    await broadcastAutoRunStatus('complete', {
+      currentRun: successfulRuns,
+      totalRuns: autoRunTotalRuns,
+      attemptRun: attemptRuns,
+    });
   } else {
-    await addLog(`=== 已停止，完成 ${completedRuns}/${autoRunTotalRuns} 轮 ===`, 'warn');
-    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'stopped', currentRun: completedRuns, totalRuns: autoRunTotalRuns } }).catch(() => {});
+    await addLog(`=== 已停止，完成 ${successfulRuns}/${autoRunTotalRuns} 轮，共尝试 ${attemptRuns} 次 ===`, 'warn');
+    await broadcastAutoRunStatus('stopped', {
+      currentRun: successfulRuns,
+      totalRuns: autoRunTotalRuns,
+      attemptRun: attemptRuns,
+    });
   }
   autoRunActive = false;
-  await setState({ autoRunning: false });
+  autoRunAttemptRun = attemptRuns;
+  await setState({
+    autoRunSkipFailures,
+    ...getAutoRunStateUpdate(
+      stopRequested ? 'stopped' : (successfulRuns >= autoRunTotalRuns ? 'complete' : 'stopped'),
+      { currentRun: successfulRuns, totalRuns: autoRunTotalRuns, attemptRun: attemptRuns }
+    ),
+  });
   clearStopRequest();
 }
 
@@ -1564,10 +2066,11 @@ async function resumeAutoRun() {
     resumeWaiter = null;
     autoRunResumeMode = null;
   }
-  chrome.runtime.sendMessage({
-    type: 'AUTO_RUN_STATUS',
-    payload: { phase: 'running', currentRun: autoRunCurrentRun, totalRuns: autoRunTotalRuns },
-  }).catch(() => {});
+  await broadcastAutoRunStatus('running', {
+    currentRun: autoRunCurrentRun,
+    totalRuns: autoRunTotalRuns,
+    attemptRun: autoRunAttemptRun,
+  });
 }
 
 // ============================================================
@@ -1618,6 +2121,7 @@ async function executeStep3(state) {
     throw new Error('缺少邮箱地址，请先在侧边栏粘贴邮箱。');
   }
 
+  await setState({ step3StartTime: Date.now(), lastSignupCode: null });
   const password = state.customPassword || generatePassword();
   await setPasswordState(password);
 
@@ -1642,14 +2146,49 @@ async function executeStep3(state) {
 // ============================================================
 
 function getMailConfig(state) {
-  return { source: 'burner-mail', url: BURNER_MAILBOX_URL, label: 'Burner Mailbox' };
+  const provider = normalizeEmailProvider(state?.emailProvider);
+  if (provider === EMAIL_PROVIDER_2925) {
+    return {
+      source: 'mail-2925',
+      url: MAIL_2925_URL,
+      label: '2925 邮箱',
+      navigateOnReuse: true,
+      reloadIfSameUrl: true,
+    };
+  }
+  if (provider === EMAIL_PROVIDER_QQ) {
+    return {
+      source: 'qq-mail',
+      url: QQ_MAIL_URL,
+      label: 'QQ 邮箱',
+      navigateOnReuse: false,
+    };
+  }
+  if (provider === EMAIL_PROVIDER_163) {
+    return {
+      source: 'mail-163',
+      url: MAIL_163_URL,
+      label: '163 邮箱',
+      navigateOnReuse: false,
+    };
+  }
+  return {
+    source: 'burner-mail',
+    url: BURNER_MAILBOX_URL,
+    label: 'Burner Mailbox',
+    navigateOnReuse: false,
+  };
 }
 
 function isNoMatchingEmailError(error) {
   const message = error?.message || String(error || '');
   return message.includes('No matching verification email found')
     || message.includes('No new matching email found')
-    || message.includes('未在 Burner Mailbox 中找到匹配的验证码邮件');
+    || message.includes('未在 Burner Mailbox 中找到匹配的验证码邮件')
+    || message.includes('2925 收件箱中暂未找到当前子邮箱的验证码邮件')
+    || message.includes('2925 收件箱中未找到比上一次更新更新的验证码邮件')
+    || message.includes('仍未找到新的匹配邮件')
+    || message.includes('暂未找到');
 }
 
 function getOtpPollingConfig(state) {
@@ -1670,6 +2209,7 @@ async function openMailTab(mail) {
       await reuseOrCreateTab(mail.source, mail.url, {
         inject: mail.inject,
         injectSource: mail.injectSource,
+        reloadIfSameUrl: mail.reloadIfSameUrl,
       });
     } else {
       const tabId = await getTabId(mail.source);
@@ -1679,6 +2219,7 @@ async function openMailTab(mail) {
     await reuseOrCreateTab(mail.source, mail.url, {
       inject: mail.inject,
       injectSource: mail.injectSource,
+      reloadIfSameUrl: mail.reloadIfSameUrl,
     });
   }
 }
@@ -1687,29 +2228,60 @@ async function clickResendOnSignupPage(step, clicks = 1) {
   const signupTabId = await getTabId('signup-page');
   if (!signupTabId) {
     await addLog(`步骤 ${step}：授权页标签已关闭，跳过预先重发验证码。`, 'warn');
-    return false;
+    return { clicked: false, reason: 'signup-tab-closed', clicks: 0 };
   }
 
   await chrome.tabs.update(signupTabId, { active: true });
   try {
-    await sendToContentScript('signup-page', {
+    const resendResult = await sendToContentScript('signup-page', {
       type: 'RESEND_VERIFICATION_EMAIL',
       step,
       source: 'background',
       payload: { clicks },
     });
-    return true;
+    const normalizedResult = {
+      clicked: Boolean(resendResult?.clicked ?? resendResult?.resent),
+      clicks: Number(resendResult?.clicks || clicks),
+      buttonText: String(resendResult?.buttonText || '').trim(),
+      method: String(resendResult?.method || (resendResult?.clicked || resendResult?.resent ? 'resend-button' : 'unknown')),
+      recoveredByGoingBack: Boolean(resendResult?.recoveredByGoingBack),
+    };
+
+    if (!normalizedResult.clicked) {
+      await addLog(`步骤 ${step}：预先重发验证码未执行成功。`, 'warn');
+      return normalizedResult;
+    }
+
+    const recoveredHint = normalizedResult.recoveredByGoingBack ? '（已先回退恢复验证页）' : '';
+    const buttonHint = normalizedResult.buttonText ? `，按钮“${normalizedResult.buttonText}”` : '';
+    await addLog(
+      `步骤 ${step}：已点击重新发送验证码${recoveredHint}${buttonHint}，方式 ${normalizedResult.method}。`,
+      'ok'
+    );
+
+    const state = await getState().catch(() => null);
+    const mail = state ? getMailConfig(state) : null;
+    if (mail && !mail.error && mail.source && mail.source !== 'signup-page') {
+      const mailTabId = await getTabId(mail.source);
+      if (mailTabId) {
+        await chrome.tabs.update(mailTabId, { active: true });
+        await addLog(`步骤 ${step}：已切回 ${mail.label} 页面，继续等待验证码。`);
+      }
+    }
+
+    return normalizedResult;
   } catch (err) {
     await addLog(`步骤 ${step}：预先重发验证码已跳过：${err.message}`, 'warn');
-    return false;
+    return { clicked: false, reason: 'send-failed', error: err.message, clicks: 0 };
   }
 }
 
 async function requestVerificationEmailResend(step, clicks = 2) {
-  const clicked = await clickResendOnSignupPage(step, clicks);
-  if (!clicked) {
+  const resendResult = await clickResendOnSignupPage(step, clicks);
+  if (!resendResult?.clicked) {
     throw new Error('授权页标签已关闭，无法请求重新发送验证码。');
   }
+  return resendResult;
 }
 
 async function pollVerificationCodeWithRetry(step, state, options) {
@@ -1718,6 +2290,7 @@ async function pollVerificationCodeWithRetry(step, state, options) {
     senderFilters,
     subjectFilters,
     targetEmail,
+    excludeCodes,
     successLogMessage,
     failureLabel,
   } = options;
@@ -1746,6 +2319,7 @@ async function pollVerificationCodeWithRetry(step, state, options) {
           senderFilters,
           subjectFilters,
           targetEmail,
+          excludeCodes,
           maxAttempts: chunkAttempts,
           intervalMs: OTP_POLL_INTERVAL_MS,
         },
@@ -1785,8 +2359,15 @@ async function pollVerificationCodeWithRetry(step, state, options) {
     }
 
     await addLog(`步骤 ${step}：等待中，准备触发一次重新发送验证码（已检测 ${scannedAttempts}/${polling.maxAttempts} 次）。`, 'warn');
-    await requestVerificationEmailResend(step, 1);
-    await humanStepDelay(400, 900);
+    const resendResult = await requestVerificationEmailResend(step, 1);
+    const buttonHint = resendResult?.buttonText ? `，按钮“${resendResult.buttonText}”` : '';
+    await humanStepDelay(400, 900, async (duration) => {
+      await addLog(
+        `步骤 ${step}：已完成重发${buttonHint}，开始等待 ${duration}ms。`,
+        'info'
+      );
+    });
+    await addLog(`步骤 ${step}：等待结束，开始下一轮邮箱扫描。`, 'info');
   }
 
   if (autoRunActive) {
@@ -1804,13 +2385,15 @@ async function executeStep4(state) {
 
   await clickResendOnSignupPage(4, 1);
   const code = await pollVerificationCodeWithRetry(4, state, {
-    filterAfterTimestamp: state.flowStartTime || 0,
+    filterAfterTimestamp: getStep4FilterAfterTimestamp(state, state.flowStartTime || 0),
     senderFilters: ['openai', 'noreply', 'verify', 'auth', 'chatgpt'],
     subjectFilters: ['verify', 'verification', 'code', '验证', 'confirm'],
     targetEmail: state.email,
+    excludeCodes: state.lastSignupCode ? [state.lastSignupCode] : [],
     successLogMessage: (value) => `步骤 4：已获取验证码：${value}`,
     failureLabel: '未收到注册验证码邮件',
   });
+  await setState({ lastSignupCode: code });
 
   const signupTabId = await getTabId('signup-page');
   if (signupTabId) {
@@ -1856,6 +2439,7 @@ async function executeStep6(state) {
     throw new Error('缺少邮箱，请先完成步骤 3。');
   }
 
+  await setState({ step6StartTime: Date.now(), lastLoginCode: null });
   await addLog('步骤 6：正在打开 OAuth 链接进行登录...');
   // Reuse the signup-page tab — navigate it to the OAuth URL
   await reuseOrCreateTab('signup-page', state.oauthUrl);
@@ -1881,13 +2465,15 @@ async function executeStep7(state) {
 
   await clickResendOnSignupPage(7, 1);
   const code = await pollVerificationCodeWithRetry(7, state, {
-    filterAfterTimestamp: state.lastEmailTimestamp || state.flowStartTime || 0,
+    filterAfterTimestamp: getStep7FilterAfterTimestamp(state, state.lastEmailTimestamp || state.flowStartTime || 0),
     senderFilters: ['openai', 'noreply', 'verify', 'auth', 'chatgpt'],
     subjectFilters: ['verify', 'verification', 'code', '验证', 'confirm', 'login'],
     targetEmail: state.email,
+    excludeCodes: state.lastLoginCode ? [state.lastLoginCode] : state.lastSignupCode ? [state.lastSignupCode] : [],
     successLogMessage: (value) => `步骤 7：已获取登录验证码：${value}`,
     failureLabel: '未收到登录验证码邮件',
   });
+  await setState({ lastLoginCode: code });
 
   const signupTabId = await getTabId('signup-page');
   if (signupTabId) {

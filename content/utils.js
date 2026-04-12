@@ -5,13 +5,17 @@ const SCRIPT_SOURCE = (() => {
   const url = location.href;
   if (url.includes('auth0.openai.com') || url.includes('auth.openai.com') || url.includes('accounts.openai.com')) return 'signup-page';
   if (url.includes('burnermailbox.com/mailbox') || url.includes('burnermailbox.com/switch/')) return 'burner-mail';
+  if (url.includes('duckduckgo.com/email/settings/autofill')) return 'duck-mail';
+  if (url.includes('www.2925.com')) return 'mail-2925';
+  if (url.includes('mail.qq.com') || url.includes('wx.mail.qq.com')) return 'qq-mail';
+  if (url.includes('mail.163.com')) return 'mail-163';
   if (url.includes('chatgpt.com')) return 'chatgpt';
   // VPS panel — detected dynamically since URL is configurable
   return 'vps-panel';
 })();
 
 const LOG_PREFIX = `[SimpleAuthFlow:${SCRIPT_SOURCE}]`;
-const STOP_ERROR_MESSAGE = 'Flow stopped by user.';
+const STOP_ERROR_MESSAGE = '流程已被用户停止。';
 let flowStopped = false;
 
 chrome.runtime.onMessage.addListener((message) => {
@@ -327,7 +331,7 @@ async function humanPause(min = 250, max = 850) {
 
 // Auto-report ready on load
 // Skip ready signal from child iframes of mail pages to avoid overwriting the top frame's registration
-const _isMailChildFrame = SCRIPT_SOURCE === 'burner-mail' && window !== window.top;
+const _isMailChildFrame = ['burner-mail', 'mail-2925', 'qq-mail', 'mail-163'].includes(SCRIPT_SOURCE) && window !== window.top;
 if (!_isMailChildFrame) {
   reportReady();
 }

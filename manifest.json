@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SimpleAuthFlow",
-  "version": "2.0",
+  "version": "3.0.1",
   "description": "一个简化 ChatGPT OAuth 流程的 Chrome 扩展",
   "permissions": [
     "sidePanel",
@@ -37,6 +37,38 @@
         "https://burnermailbox.com/switch/*"
       ],
       "js": ["content/utils.js", "content/burner-mail.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.2925.com/*"
+      ],
+      "js": ["content/utils.js", "shared/mail-2925.js", "content/2925-mail.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://duckduckgo.com/email/settings/autofill*"
+      ],
+      "js": ["content/utils.js", "content/duck-mail.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://mail.qq.com/*",
+        "https://wx.mail.qq.com/*"
+      ],
+      "js": ["content/utils.js", "content/qq-mail.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://mail.163.com/*",
+        "https://*.mail.163.com/*"
+      ],
+      "js": ["content/utils.js", "content/mail-163.js"],
+      "all_frames": true,
       "run_at": "document_idle"
     }
   ],

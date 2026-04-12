@@ -244,6 +244,10 @@ header {
   gap: 8px;
 }
 
+.data-check-row {
+  align-items: flex-start;
+}
+
 .data-inline {
   display: flex;
   align-items: center;
@@ -322,6 +326,25 @@ header {
 }
 .data-select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); }
 [data-theme="dark"] .data-select { color-scheme: dark; }
+
+.data-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.data-check input[type="checkbox"] {
+  margin-top: 2px;
+  accent-color: var(--blue);
+  cursor: pointer;
+  flex-shrink: 0;
+}
 
 /* Status Bar */
 .status-bar {
@@ -510,6 +533,9 @@ header {
 .step-row.stopped .step-indicator { border-color: var(--cyan); background: rgba(8, 145, 178, 0.08); }
 .step-row.stopped .step-num { color: var(--cyan); }
 
+.step-row.skipped .step-indicator { border-color: var(--blue); background: var(--blue-soft); }
+.step-row.skipped .step-num { color: var(--blue); }
+
 /* Step Button */
 .step-btn {
   flex: 1;
@@ -533,6 +559,47 @@ header {
 .step-row.completed .step-btn { border-color: var(--border-subtle); color: var(--text-secondary); opacity: 0.7; }
 .step-row.failed .step-btn { border-color: var(--red); color: var(--red); }
 .step-row.stopped .step-btn { border-color: var(--cyan); color: var(--cyan); }
+.step-row.skipped .step-btn { border-color: rgba(37, 99, 235, 0.25); color: var(--blue); opacity: 0.82; }
+
+.step-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  width: 48px;
+  flex-shrink: 0;
+}
+
+.step-skip-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all var(--transition);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.step-skip-btn:hover:not(:disabled) {
+  border-color: var(--blue);
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.step-skip-btn:disabled {
+  color: var(--text-muted);
+  border-color: var(--border-subtle);
+  background: var(--bg-base);
+  cursor: not-allowed;
+  opacity: 0.5;
+}
 
 .step-status {
   width: 20px;
@@ -544,6 +611,7 @@ header {
 .step-row.completed .step-status { color: var(--green); }
 .step-row.failed .step-status { color: var(--red); }
 .step-row.stopped .step-status { color: var(--cyan); }
+.step-row.skipped .step-status { color: var(--blue); }
 
 /* ============================================================
    Log / Console Section
@@ -620,6 +688,60 @@ header {
 }
 
 .log-line { animation: fadeIn 120ms ease-out; }
+
+/* ============================================================
+   Auto Start Modal
+   ============================================================ */
+
+#auto-start-modal {
+  z-index: 1200;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(15, 17, 23, 0.32);
+  backdrop-filter: blur(2px);
+}
+
+.modal-overlay[hidden] {
+  display: none !important;
+}
+
+.modal-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.modal-close {
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  transition: all var(--transition);
+}
+
+.modal-close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.modal-message {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  margin-bottom: 14px;
+}
 
 /* ============================================================
    Toast Notifications

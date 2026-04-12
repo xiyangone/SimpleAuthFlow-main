@@ -207,18 +207,42 @@ async function fillVerificationCode(step, payload) {
 
 async function resendVerificationEmail(step, payload = {}) {
   const { clicks = 2 } = payload;
+  let lastClickResult = {
+    clicked: false,
+    clicks: 0,
+    buttonText: '',
+    method: 'unknown',
+    recoveredByGoingBack: false,
+  };
 
   log(`步骤 ${step}：正在查找重发邮件按钮...`);
 
   for (let i = 0; i < clicks; i++) {
     const resendBtn = await waitForResendButton(10000);
+    const buttonText = String(resendBtn?.textContent || resendBtn?.value || resendBtn?.getAttribute?.('aria-label') || '').trim();
+    let method = 'text-match';
+    if (resendBtn?.matches?.('button[name="intent"][value="resend"]')) {
+      method = 'intent-resend';
+    } else if (resendBtn?.matches?.('button[value="resend"]')) {
+      method = 'value-resend';
+    } else if (resendBtn?.matches?.('button[type="submit"][name="intent"]')) {
+      method = 'submit-intent';
+    }
+
     await humanPause(350, 900);
     simulateClick(resendBtn);
     log(`步骤 ${step}：已点击重发邮件按钮（${i + 1}/${clicks}）`);
+    lastClickResult = {
+      clicked: true,
+      clicks: i + 1,
+      buttonText,
+      method,
+      recoveredByGoingBack: false,
+    };
     await sleep(700);
   }
 
-  return { resent: true, clicks };
+  return lastClickResult;
 }
 
 async function waitForResendButton(timeout = 10000) {
